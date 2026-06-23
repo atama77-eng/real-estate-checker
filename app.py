@@ -9,6 +9,7 @@ import gzip
 import json
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 
 import requests
 import pandas as pd
@@ -19,6 +20,7 @@ import streamlit as st
 # ----------------------------------------------------------------------
 
 API_BASE_URL = "https://www.reinfolib.mlit.go.jp/ex-api/external/XIT001"
+API_CITY_URL = "https://www.reinfolib.mlit.go.jp/ex-api/external/XIT002"
 
 # st.secrets["REINFOLIB_API_KEY"] にAPIキーを設定すると本物のデータを使う。
 # 未設定の場合は自動でダミーデータモードになる。
@@ -39,15 +41,6 @@ PREFECTURES = {
     "福岡県": "40",
 }
 
-# 市区町村コード(サンプル。本番ではXIT002 APIから動的取得するのがおすすめ)
-CITIES = {
-    "13": {"中央区": "13102", "港区": "13103", "新宿区": "13104"},
-    "14": {"横浜市中区": "14104", "川崎市中原区": "14133"},
-    "27": {"大阪市北区": "27127", "大阪市中央区": "27128"},
-    "23": {"名古屋市中区": "23106"},
-    "40": {"福岡市中央区": "40130"},
-}
-
 QUARTERS = ["1", "2", "3", "4"]
 YEARS = list(range(2015, CURRENT_YEAR + 1))
 
@@ -64,7 +57,46 @@ PRICE_CLASSIFICATION_MAP = {
 # データ取得
 # ----------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False, ttl=3600)
+@st.cache_data(show_spinner=False, ttl=86400)
+def fetch_cities(pref_code):
+    """XIT002 APIから都道府県内の市区町村一覧を取得する。結果は24時間キャッシュ。"""
+    if USE_DUMMY_DATA:
+        return {"指定なし": None}
+    try:
+        resp = requests.get(
+            API_CITY_URL,
+            params={"area": pref_code},
+            headers={"Ocp-Apim-Subscription-Key": API_KEY},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        try:
+            data = json.loads(gzip.decompress(resp.content))
+        except (gzip.BadGzipFile, OSError):
+            data = resp.json()
+        cities = {"指定なし": None}
+        for item in data.get("data", []):
+            name = item.get("cityName") or item.get("name") or item.get("municipality")
+            code = item.get("cityCode") or item.get("code") or item.get("id")
+            if name and code:
+                cities[name] = code
+        return cities
+    except Exception as e:
+        st.warning(f"市区町村リストの取得に失敗しました: {e}")
+        return {"指定なし": None}
+
+
+@st.cache_data(show_spinner=False)
+def load_station_codes():
+    """station_codes.csvから駅名→駅コードの辞書を返す。ファイルがなければ空dict。"""
+    csv_path = Path(__file__).parent / "station_codes.csv"
+    if not csv_path.exists():
+        return {}
+    df = pd.read_csv(csv_path, dtype=str)
+    return dict(zip(df["station_name"], df["station_code"]))
+
+
+
 def fetch_transactions(area_code, city_code, year_from, quarter_from, year_to, quarter_to,
                         price_classification, station_code=None):
     """国交省APIから取引価格情報を取得する。複数四半期にわたる場合は年×四半期分ループする。"""
@@ -95,10 +127,9 @@ def fetch_transactions(area_code, city_code, year_from, quarter_from, year_to, q
                     continue  # データなし
                 resp.raise_for_status()
 
-                content_encoding = resp.headers.get("Content-Encoding", "").lower()
-                if "gzip" in content_encoding:
+                try:
                     data = json.loads(gzip.decompress(resp.content))
-                else:
+                except (gzip.BadGzipFile, OSError):
                     data = resp.json()
 
                 rows = data.get("data", [])
@@ -174,12 +205,24 @@ with st.sidebar:
     pref_name = st.selectbox("都道府県", list(PREFECTURES.keys()))
     pref_code = PREFECTURES[pref_name]
 
-    city_options = ["指定なし"] + list(CITIES.get(pref_code, {}).keys())
-    city_name = st.selectbox("市区町村", city_options)
-    city_code = CITIES.get(pref_code, {}).get(city_name) if city_name != "指定なし" else None
+    with st.spinner("市区町村を読み込み中..."):
+        cities = fetch_cities(pref_code)
+    city_name = st.selectbox("市区町村", list(cities.keys()))
+    city_code = cities.get(city_name)
 
-    station_name = st.text_input("最寄り駅(任意・駅コードが必要)", "")
-
+    station_codes = load_station_codes()
+    if station_codes:
+        station_options = ["指定なし"] + sorted(station_codes.keys())
+        station_name = st.selectbox(
+            "最寄り駅(任意)",
+            station_options,
+            help="駅名を入力して絞り込めます",
+        )
+        station_code = station_codes.get(station_name) if station_name != "指定なし" else None
+    else:
+        st.text_input("最寄り駅(任意)", disabled=True,
+                      help="station_codes.csvが見つかりません。convert_station_geojson.pyを実行してください。")
+        station_code = None
     property_type = st.selectbox("種別", TYPE_OPTIONS)
 
     price_classification_label = st.selectbox("価格情報区分", list(PRICE_CLASSIFICATION_MAP.keys()))
@@ -220,7 +263,7 @@ if search_clicked or USE_DUMMY_DATA:
             year_to=year_to,
             quarter_to=int(quarter_to),
             price_classification=PRICE_CLASSIFICATION_MAP[price_classification_label],
-            station_code=station_name or None,
+            station_code=station_code or None,
         )
 
     if df.empty:
@@ -252,6 +295,34 @@ if search_clicked or USE_DUMMY_DATA:
         # 取引一覧
         # ----------------------------------------------------------------
         st.subheader("取引一覧")
+
+        # 並び替えコントロール
+        sort_col1, sort_col2 = st.columns([2, 1])
+        with sort_col1:
+            sort_by = st.selectbox(
+                "並び替え",
+                ["取引価格", "築年数", "面積(㎡)", "取引時点"],
+                label_visibility="collapsed",
+            )
+        with sort_col2:
+            sort_order = st.radio(
+                "順序",
+                ["降順 ↓", "昇順 ↑"],
+                horizontal=True,
+                label_visibility="collapsed",
+            )
+
+        sort_col_map = {
+            "取引価格": "TradePrice",
+            "築年数": "築年数",
+            "面積(㎡)": "Area",
+            "取引時点": "Period",
+        }
+        sort_key = sort_col_map[sort_by]
+        ascending = sort_order == "昇順 ↑"
+        if sort_key in filtered.columns:
+            filtered = filtered.sort_values(sort_key, ascending=ascending, na_position="last")
+
         display_cols = {
             "DistrictName": "地区",
             "Period": "取引時点",
