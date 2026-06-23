@@ -75,15 +75,9 @@ def fetch_cities(pref_code):
         except (gzip.BadGzipFile, OSError):
             data = resp.json()
         cities = {"指定なし": None}
-        # デバッグ: 実際のレスポンスを表示
-        raw_data = data.get("data", [])
-        if raw_data:
-            st.sidebar.write("🔍 APIレスポンス(先頭1件):", raw_data[0])
-        else:
-            st.sidebar.write("🔍 dataキーの中身が空です。キー一覧:", list(data.keys()))
         for item in data.get("data", []):
-            name = item.get("Municipality") or item.get("municipality") or ""
-            code = item.get("MunicipalityCode") or item.get("municipalityCode") or ""
+            name = item.get("name") or ""
+            code = item.get("id") or ""
             if name and code:
                 cities[name] = code
         return cities
