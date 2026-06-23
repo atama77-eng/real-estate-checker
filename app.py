@@ -76,8 +76,8 @@ def fetch_cities(pref_code):
             data = resp.json()
         cities = {"指定なし": None}
         for item in data.get("data", []):
-            name = item.get("cityName") or item.get("name") or item.get("municipality")
-            code = item.get("cityCode") or item.get("code") or item.get("id")
+            name = item.get("Municipality") or item.get("municipality") or ""
+            code = item.get("MunicipalityCode") or item.get("municipalityCode") or ""
             if name and code:
                 cities[name] = code
         return cities
