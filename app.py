@@ -13,6 +13,8 @@ from pathlib import Path
 
 import requests
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 # ----------------------------------------------------------------------
@@ -182,6 +184,118 @@ def add_building_age(df):
     return df
 
 
+def add_building_age_group(df):
+    """築年数から築年数帯ラベルを追加する。"""
+    def classify(age):
+        if pd.isna(age):
+            return "不明"
+        elif age <= 10:
+            return "築10年以内"
+        elif age <= 20:
+            return "築10〜20年"
+        else:
+            return "築20年超"
+    df = df.copy()
+    df["築年数帯"] = df["築年数"].apply(classify)
+    return df
+
+
+AGE_GROUP_ORDER = ["築10年以内", "築10〜20年", "築20年超", "不明"]
+AGE_GROUP_COLORS = {
+    "築10年以内": "#B5572D",
+    "築10〜20年": "#5B6B4F",
+    "築20年超":   "#4A7FA5",
+    "不明":       "#AAAAAA",
+}
+
+
+def sort_periods(periods):
+    """'2024年第1四半期'形式の文字列リストを時系列順にソートして返す。"""
+    def key(p):
+        try:
+            parts = pd.Series([p]).str.extract(r"(\d{4})年第(\d)四半期").iloc[0]
+            return int(parts[0]) * 10 + int(parts[1])
+        except Exception:
+            return 0
+    return sorted(periods, key=key)
+
+
+def build_trend_chart(filtered_df, label="メイン"):
+    """
+    取引時点別の平均㎡単価推移(折れ線) + 件数(棒グラフ)を
+    築年数帯別に色分けしたPlotly図を返す。
+    """
+    if "Period" not in filtered_df.columns:
+        return None, None
+
+    filtered_df = add_building_age_group(filtered_df)
+    age_groups = [g for g in AGE_GROUP_ORDER if g in filtered_df["築年数帯"].unique()]
+
+    summary_all = (
+        filtered_df.groupby("Period")
+        .agg(**{
+            "㎡単価(平均)": ("UnitPrice", "mean"),
+            "坪単価(平均)": ("PricePerUnit", "mean"),
+            "件数": ("TradePrice", "count"),
+        })
+        .reset_index()
+    )
+    periods = sort_periods(summary_all["Period"].tolist())
+    summary_all = summary_all.set_index("Period").reindex(periods).reset_index()
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # 築年数帯別 折れ線
+    for group in age_groups:
+        group_df = filtered_df[filtered_df["築年数帯"] == group]
+        grp_summary = (
+            group_df.groupby("Period")
+            .agg(**{"㎡単価(平均)": ("UnitPrice", "mean")})
+            .reset_index()
+            .set_index("Period")
+            .reindex(periods)
+            .reset_index()
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=grp_summary["Period"],
+                y=grp_summary["㎡単価(平均)"],
+                name=f"{label} {group}",
+                mode="lines+markers",
+                line=dict(color=AGE_GROUP_COLORS.get(group, "#888"), width=2),
+                marker=dict(size=6),
+                hovertemplate="%{x}<br>㎡単価: ¥%{y:,.0f}<extra>" + group + "</extra>",
+            ),
+            secondary_y=False,
+        )
+
+    # 件数 棒グラフ
+    fig.add_trace(
+        go.Bar(
+            x=summary_all["Period"],
+            y=summary_all["件数"],
+            name=f"{label} 件数",
+            marker_color="rgba(180,180,180,0.35)",
+            hovertemplate="%{x}<br>件数: %{y}件<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+
+    fig.update_layout(
+        height=420,
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hovermode="x unified",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    fig.update_yaxes(title_text="㎡単価(円)", tickprefix="¥", tickformat=",", secondary_y=False)
+    fig.update_yaxes(title_text="件数", secondary_y=True, showgrid=False)
+    fig.update_xaxes(tickangle=-30)
+
+    return fig, summary_all
+
+
 def to_numeric_safe(series):
     return pd.to_numeric(series, errors="coerce")
 
@@ -246,6 +360,21 @@ with st.sidebar:
     price_range = st.slider("取引価格(円)", 0, 200_000_000, (0, 200_000_000), step=1_000_000)
 
     search_clicked = st.button("価格を検索", type="primary", use_container_width=True)
+
+    st.divider()
+    st.subheader("比較エリア(任意)")
+    compare_enabled = st.checkbox("別エリアと比較する")
+    compare_city_code = None
+    compare_pref_code = None
+    compare_label = ""
+    if compare_enabled:
+        compare_pref_name = st.selectbox("比較: 都道府県", list(PREFECTURES.keys()), key="cmp_pref")
+        compare_pref_code = PREFECTURES[compare_pref_name]
+        with st.spinner("市区町村を読み込み中..."):
+            compare_cities = fetch_cities(compare_pref_code)
+        compare_city_name = st.selectbox("比較: 市区町村", list(compare_cities.keys()), key="cmp_city")
+        compare_city_code = compare_cities.get(compare_city_name)
+        compare_label = f"{compare_pref_name} {compare_city_name}"
 
 # ----------------------------------------------------------------------
 # データ取得 & フィルタ
@@ -349,37 +478,68 @@ if search_clicked or USE_DUMMY_DATA:
         # ----------------------------------------------------------------
         st.subheader("取引時点別 平均単価の推移")
         if "Period" in filtered.columns:
-            summary = (
-                filtered.groupby("Period")
-                .agg(
-                    **{
-                        "㎡単価(平均)": ("UnitPrice", "mean"),
-                        "坪単価(平均)": ("PricePerUnit", "mean"),
-                        "件数": ("TradePrice", "count"),
-                    }
-                )
-                .reset_index()
-            )
-            # Period文字列(例: "2024年第1四半期")でソートできるよう、補助列を作る
-            try:
-                summary["_sort"] = summary["Period"].str.extract(r"(\d{4})年第(\d)四半期").apply(
-                    lambda r: int(r[0]) * 10 + int(r[1]), axis=1
-                )
-                summary = summary.sort_values("_sort").drop(columns="_sort")
-            except Exception:
-                pass
+            main_label = f"{pref_name} {city_name}" if city_name != "指定なし" else pref_name
+            fig, summary_main = build_trend_chart(filtered, label=main_label)
 
-            chart_df = summary.set_index("Period")[["㎡単価(平均)", "坪単価(平均)"]]
-            st.line_chart(chart_df)
+            # 比較エリアのデータを取得して同じグラフに重ねる
+            if compare_enabled and compare_pref_code:
+                with st.spinner("比較エリアのデータを取得中..."):
+                    df_compare = fetch_transactions(
+                        area_code=compare_pref_code,
+                        city_code=compare_city_code,
+                        year_from=year_from,
+                        quarter_from=int(quarter_from),
+                        year_to=year_to,
+                        quarter_to=int(quarter_to),
+                        price_classification=PRICE_CLASSIFICATION_MAP[price_classification_label],
+                    )
+                if not df_compare.empty:
+                    df_compare = add_building_age(df_compare)
+                    df_compare["UnitPrice"] = to_numeric_safe(df_compare["UnitPrice"])
+                    df_compare["PricePerUnit"] = to_numeric_safe(df_compare["PricePerUnit"])
+                    df_compare["TradePrice"] = to_numeric_safe(df_compare["TradePrice"])
+                    df_compare = add_building_age_group(df_compare)
 
-            st.dataframe(
-                summary.style.format({
-                    "㎡単価(平均)": "¥{:,.0f}",
-                    "坪単価(平均)": "¥{:,.0f}",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
+                    age_groups_cmp = [g for g in AGE_GROUP_ORDER if g in df_compare["築年数帯"].unique()]
+                    cmp_periods = sort_periods(df_compare["Period"].unique().tolist())
+
+                    for group in age_groups_cmp:
+                        grp_df = df_compare[df_compare["築年数帯"] == group]
+                        grp_summary = (
+                            grp_df.groupby("Period")
+                            .agg(**{"㎡単価(平均)": ("UnitPrice", "mean")})
+                            .reset_index()
+                            .set_index("Period")
+                            .reindex(cmp_periods)
+                            .reset_index()
+                        )
+                        fig.add_trace(
+                            go.Scatter(
+                                x=grp_summary["Period"],
+                                y=grp_summary["㎡単価(平均)"],
+                                name=f"{compare_label} {group}",
+                                mode="lines+markers",
+                                line=dict(color=AGE_GROUP_COLORS.get(group, "#888"), width=2, dash="dash"),
+                                marker=dict(size=6, symbol="diamond"),
+                                hovertemplate="%{x}<br>㎡単価: ¥%{y:,.0f}<extra>" + f"{compare_label} {group}" + "</extra>",
+                            ),
+                            secondary_y=False,
+                        )
+
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("実線: メインエリア / 破線: 比較エリア / 棒グラフ: 件数(右軸) / 色: 築年数帯")
+
+            if summary_main is not None:
+                st.dataframe(
+                    summary_main.style.format({
+                        "㎡単価(平均)": "¥{:,.0f}",
+                        "坪単価(平均)": "¥{:,.0f}",
+                        "件数": "{:,}件",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
         else:
             st.caption("取引時点データがありません。")
 else:
